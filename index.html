@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Display a map</title>
+  <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <script src="https://unpkg.com/maplibre-gl@1.15.2/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/mpetazzoni/sse.js/lib/sse.min.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@1.15.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+    }
+
+    #map {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 100%;
+    }
+
+    #map-overlay {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1;
+      background-color: gainsboro;
+      color: dimgray;
+    }
+
+    #green-overlay {
+      position: absolute;
+      top: 10px;
+      right: 200px;
+      z-index: 2;
+      background-color: transparent;
+      color: rgb(38, 95, 5);
+      font-family: "Lucida Console", "Courier New", monospace;
+      font-size: large;
+      font-weight: bolder;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="green-overlay"><span id="greentext">FFFFFFFF</span></div>
+  <div id="map-overlay">
+    <form><textarea name="inputfilter" id="inputtoken" rows="10" cols="50"
+      onchange='saveValue(this);'></textarea><br />
+    <input onclick="pressUrl()" type="radio" id="ais-url" name="drone" value="huey" checked>position endpoint
+    <input onclick="pressUrl()" type="radio" id="combined-url" name="drone" value="ff">combined endpoint<br>
+  </form>
+    <textarea name="inputfilter" id="inputurl" rows="1" cols="50">https://live.ais.barentswatch.no/v1/sse/ais</textarea><br />
+    <input onclick="pressFilter()" type="radio" id="no-filter" name="drone" value="huey" checked>no-filter
+    <input onclick="pressFilter()" type="radio" id="area-filter" name="drone" value="dewey">area-filter
+    <input onclick="pressFilter()" type="radio" id="mmsi-filter" name="drone" value="louie">mmsi-filter<br />
+    <textarea name="inputfilter" id="inputfilter" rows="10" cols="50">
+{
+  "downsample": false,
+  "includePosition": true,
+  "includeStatic": false,
+  "includeAton": false
+}
+    </textarea><br />
+    <button type="button" onclick="pressButton()">Start stream</button>
+    <button type="button" onclick="panToBoats()">Pan to visible boats</button>
+
+    Log to console: <input type="checkbox" onchange="getChecked()" id='logToConsoleCheckBox'></form>
+  </div>
+  <div id="map"></div>
+  <script>
+    var logToConsole = false;
+    function boatIcon() {
+      const width = 20;
+      const height = 40;
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.imageSmoothingEnabled = false;
+      const context = canvas.getContext('2d');
+      context.clearRect(0, 0, width, height);
+      context.beginPath();
+      context.moveTo(0, height / 3);
+      context.lineTo(width / 2, 0);
+      context.lineTo(width, height / 3);
+      context.lineTo(width, height);
+      context.lineTo(0, height);
+      context.lineTo(0, height / 3);
+      context.fillStyle = `rgba(120, 120, 120, 1)`;
+      context.fill();
+      return {
+        width: width,
+        height: height,
+        data: context.getImageData(0, 0, width, height).data
+      };
+    };
+
+    const boats = {
+      type: "FeatureCollection",
+      features: []
+    };
+    var totalMessagesCounter = 0;
+    function recieveandadd(message) {
+      totalMessagesCounter++;
+      if (message.data == ''){
+        return;
+      }
+      var geoFeature = JSON.parse(message.data);
+      if (logToConsole) {
+        if (geoFeature.type == "Static" || geoFeature.messageType == 24) {
+        console.log(`${JSON.stringify(geoFeature)}`)
+        }
+      }
+      if (aisUrl) {
+        if (geoFeature.messageType == 5 || geoFeature.messageType == 24) {
+          return;
+        }
+        geoFeature = {
+          "type": "Feature",
+          "geometry": {
+            "type": "Point",
+            "coordinates": [geoFeature.longitude, geoFeature.latitude]
+          },
+          "properties": {
+            "mmsi": geoFeature.mmsi,
+            "msgtime": geoFeature.msgtime,
+            "speedOverGround": geoFeature.speedOverGround,
+            "trueHeading": geoFeature.trueHeading,
+            "courseOverGround": geoFeature.courseOverGround
+          }
+        }
+      };
+      if (boats.features.some(f => f.properties.mmsi == geoFeature.properties.mmsi)) {
+        boat = boats.features.find(f => f.properties.mmsi == geoFeature.properties.mmsi);
+        var index = boats.features.indexOf(boat)
+        boats.features[index] = geoFeature;
+      } else {
+        boats.features.push(geoFeature);
+      }
+    }
+
+
+    var counter = 0;
+    var totaltfpscounter = 0;
+    var connectedAtTime = 0;
+    var lastRun = 0;
+    var fpsBuffer2 = [0, 0];
+    var msgBuffer2 = [0, 0];
+    function animateBoats(timestamp) {
+      var thisrun = Math.floor(Date.now() / 1000 % 2);
+      if (lastRun != thisrun) {
+        fpsBuffer2[thisrun] = 0;
+        lastRun = thisrun;
+      }
+      fpsBuffer2[thisrun]++;
+      counter++;
+      totaltfpscounter++;
+      if (counter == 1) {
+        if (totalMessagesCounter > 0 && connectedAtTime == 0) {
+          connectedAtTime = timestamp;
+        }
+        modTimestampRaw = (Date.now() / 1000 % 2);
+        var newBoat = {
+          type: "FeatureCollection",
+          features: []
+        };
+        boats.features.forEach(boat => {
+          newBoat.features.push(boat);
+        });
+        var msgpersec = timestamp
+        var greenTexttext = `${newBoat.features.length}  vessels recieved<br>
+        ${totalMessagesCounter} messages recieved<br>
+        ${Math.floor(totalMessagesCounter / (timestamp - connectedAtTime) * 1000)} msg/sec average <br>
+        ${Math.floor(totaltfpscounter / timestamp * 1000)} avg fps<br>
+        ${Math.floor(fpsBuffer2.reduce((a, b) => a + b) / (1 + (modTimestampRaw % 1)))} fps`;
+
+        document.getElementById('greentext').innerHTML = greenTexttext;
+        map.getSource('boats').setData(newBoat);
+      }
+      if (counter == 2) {
+        counter = 0;
+      }
+      requestAnimationFrame(animateBoats);
+    }
+
+    EventSource = SSE;
+
+    function initStream(access_token, filter, url) {
+      const source = new EventSource(url, {
+        headers: {
+          'Authorization': 'bearer ' + access_token,
+          'Content-Type': 'application/json;charset=utf-8'
+        },
+        payload: JSON.stringify(filter)
+      });
+      source.stream();
+      source.addEventListener("message", function (message) {
+        recieveandadd(message);
+      });
+    }
+
+    var map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://tiles01.barentswatch.no/styles/basic-preview/style.json',
+      center: [10.178, 63.482],
+      zoom: 5
+    });
+
+    map.on('load', async () => {
+      map.addImage('boatIcon', boatIcon(), { sdf: "true" }, { pixelRatio: 2 });
+      map.addSource('boats', {
+        type: 'geojson',
+        data: boats
+      });
+      map.addLayer({
+        'id': 'boats',
+        'type': 'symbol',
+        'source': 'boats',
+        'layout': {
+          'icon-image': 'boatIcon',
+          'icon-allow-overlap': true,
+          'icon-rotate': ['get', 'trueHeading'],
+          "icon-size": [
+            'interpolate',
+            ['linear', 0.5],
+            ['zoom'],
+            4,
+            0.1,
+            12,
+            0.7
+          ],
+        },
+        "paint": {
+          "icon-color": ["case",
+            ["<", 20, ["get", "speedOverGround"]], "#f6aa1c",
+            ["<", 10, ["get", "speedOverGround"]], "#bc3908",
+            ["<", 7, ["get", "speedOverGround"]], "#941b0c",
+            ["<", 5, ["get", "speedOverGround"]], "#38040e",
+            ["<", 2, ["get", "speedOverGround"]], "#220901",
+            "#000000"
+          ],
+          "icon-halo-color": "#000000",
+          "icon-halo-width": 0,
+          "icon-halo-blur": 1
+        }
+      });
+
+      map.on('click', 'boats', function (e) {
+        const coordinates = e.features[0].geometry.coordinates;
+        const description = `<textarea rows="15" cols="35">${JSON.stringify(e.features[0].properties, null, 2)}</textarea>`;
+        while (Math.abs(e.lngLat.lng - coordinates[0]) > 180) {
+          coordinates[0] += e.lngLat.lng > coordinates[0] ? 360 : -360;
+        }
+        new maplibregl.Popup()
+          .setLngLat(coordinates)
+          .setHTML(description)
+          .addTo(map);
+      });
+
+      map.on('mouseenter', 'boats', function () {
+        map.getCanvas().style.cursor = 'pointer';
+      });
+
+      map.on('mouseleave', 'boats', function () {
+        map.getCanvas().style.cursor = '';
+      });
+
+      requestAnimationFrame(animateBoats);
+    });
+
+    function pressButton() {
+      var token = document.getElementById('inputtoken').value;
+      var filter = JSON.parse(document.getElementById('inputfilter').value);
+      var url = document.getElementById('inputurl').value;
+      initStream(token, filter, url);
+    }
+
+    function getChecked() {
+      logToConsole = document.getElementById('logToConsoleCheckBox').checked;
+    }
+
+  
+    var filterNoFilter = {
+      "downsample": false,
+      "includePosition": true,
+      "includeStatic": false,
+      "includeAton": false
+    };
+
+    var filterNoFilterGeojson = {
+      "downsample": false,
+      "modelFormat": "Geojson",
+      "modelType": "Full"
+    };
+
+    var filterMmsiFilter = {
+      "downsample": false,
+      "includePosition": true,
+      "includeStatic": false,
+      "includeAton": false,
+      "mmsi":
+        [257338000,
+          259551000,
+          258063000,
+          257011900,
+          257036360,
+          257060020,
+          257071700,
+          257074020,
+          257078800,
+          257273400,
+          257287000,
+          257338000,
+          257720600,
+          257858000,
+          257961900,
+          258000810,
+          258063000,
+          258098500,
+          258226000,
+          258289500,
+          258305000,
+          258424000,
+          258452000,
+          258593000,
+          259276000,
+          259395000,
+          259551000,
+          259592000
+        ]
+    };
+
+    var filterMmsiFilterGeojson = {
+      "downsample": false,
+      "modelFormat": "Geojson",
+      "modelType": "Full",
+      "mmsi":
+        [257338000,
+          259551000,
+          258063000,
+          257011900,
+          257036360,
+          257060020,
+          257071700,
+          257074020,
+          257078800,
+          257273400,
+          257287000,
+          257338000,
+          257720600,
+          257858000,
+          257961900,
+          258000810,
+          258063000,
+          258098500,
+          258226000,
+          258289500,
+          258305000,
+          258424000,
+          258452000,
+          258593000,
+          259276000,
+          259395000,
+          259551000,
+          259592000
+        ]
+    };
+
+
+    var filterAreaFilter = {
+      "downsample": false,
+      "includePosition": true,
+      "includeStatic": false,
+      "includeAton": false,
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+        [
+            [
+              7.5146484375,
+              63.102214744636086
+            ],
+            [
+              9.909667968749998,
+              63.102214744636086
+            ],
+            [
+              9.909667968749998,
+              63.8721337832775
+            ],
+            [
+              7.5146484375,
+              63.8721337832775
+            ],
+            [
+              7.5146484375,
+              63.102214744636086
+            ]
+          ]
+        ]
+      }
+    };
+
+    var filterAreaFilterGeojson = {
+      "downsample": false,
+      "modelFormat": "Geojson",
+      "modelType": "Full",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+        [
+            [
+              7.5146484375,
+              63.102214744636086
+            ],
+            [
+              9.909667968749998,
+              63.102214744636086
+            ],
+            [
+              9.909667968749998,
+              63.8721337832775
+            ],
+            [
+              7.5146484375,
+              63.8721337832775
+            ],
+            [
+              7.5146484375,
+              63.102214744636086
+            ]
+          ]
+        ]
+      }
+    };
+
+    var urlAisUrl = "https://live.ais.barentswatch.no/v1/sse/ais";
+    var urlCombinedUrl = "https://live.ais.barentswatch.no/v1/sse/combined";
+    var aisUrl = true;
+
+    function pressUrl() {
+      aisUrl = document.getElementById('ais-url').checked;
+      var combinedUrl = document.getElementById('combined-url').checked;
+      if (aisUrl) {
+        document.getElementById('inputurl').innerHTML = urlAisUrl;
+      }
+      if (combinedUrl) {
+        document.getElementById('inputurl').innerHTML = urlCombinedUrl;
+      }
+      pressFilter();
+    }
+    function pressFilter() {
+      var noFilter = document.getElementById('no-filter').checked;
+      var areaFilter = document.getElementById('area-filter').checked;
+      var mmsiFilter = document.getElementById('mmsi-filter').checked;
+      if (document.getElementById('ais-url').checked){
+        if (noFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterNoFilter, null, 2);
+        }
+        if (areaFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterAreaFilter, null, 2);
+        }
+        if (mmsiFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterMmsiFilter, null, 2);
+        }
+      }
+      if (document.getElementById('combined-url').checked){
+        if (noFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterNoFilterGeojson, null, 2);
+        }
+        if (areaFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterAreaFilterGeojson, null, 2);
+        }
+        if (mmsiFilter) {
+          document.getElementById('inputfilter').innerHTML = JSON.stringify(filterMmsiFilterGeojson, null, 2);
+        }
+      }
+    }
+
+    document.getElementById("inputtoken").value = getSavedValue("inputtoken");    // set the value to this input
+    /* Here you can add more inputs to set value. if it's saved */
+
+    //Save the value function - save it to localStorage as (ID, VALUE)
+    function saveValue(e) {
+      var id = e.id;  // get the sender's id to save it . 
+      var val = e.value; // get the value. 
+      localStorage.setItem(id, val);// Every time user writing something, the localStorage's value will override . 
+    }
+    
+    //get the saved value function - return the value of "v" from localStorage. 
+    function getSavedValue(v) {
+      if (!localStorage.getItem(v)) {
+        return "";// You can change this to your defualt value. 
+      }
+      return localStorage.getItem(v);
+    }
+    function panToBoats() {
+      const coordinates = boats.features[0].geometry.coordinates;
+      const bounds = new maplibregl.LngLatBounds(
+        coordinates,
+        coordinates
+      );
+      boats.features.forEach(feature => bounds.extend(feature.geometry.coordinates));
+      map.fitBounds(bounds, {
+        padding: 50
+      });
+    }
+
+  </script>
+
+</body>
+
+</html>
